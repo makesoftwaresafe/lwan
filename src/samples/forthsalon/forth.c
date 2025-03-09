@@ -40,52 +40,31 @@
 
 #include "forth.h"
 
-#define NO_INCBIN
-#include "forth-jit-inc.h"
+#define TAIL_CALL return
+#if defined __has_attribute
+#  if __has_attribute (musttail)
+#    undef TAIL_CALL
+#    define TAIL_CALL __attribute__((musttail)) return
+#  endif
+#endif
 
-enum forth_opcode {
-    OP_CALL_BUILTIN,
-    OP_EVAL_CODE,
-    OP_NUMBER,
-    OP_JUMP_IF,
-    OP_JUMP,
-    OP_NOP,
-};
-
-struct forth_ctx;
-struct forth_vars;
-struct forth_ir_code;
-union forth_inst;
-
-struct forth_ir {
-    union {
-        double number;
-        struct forth_ir_code *code;
-        void (*callback)(union forth_inst *,
-                         double *d_stack,
-                         double *r_stack,
-                         struct forth_vars *vars);
-        size_t pc;
-    };
-    enum forth_opcode opcode;
-};
+#define MAX_WORD_LEN 64
 
 union forth_inst {
     void (*callback)(union forth_inst *,
                      double *d_stack,
                      double *r_stack,
                      struct forth_vars *vars);
+    struct forth_code *code;
     double number;
     size_t pc;
 };
 
-DEFINE_ARRAY_TYPE(forth_ir_code, struct forth_ir)
 DEFINE_ARRAY_TYPE(forth_code, union forth_inst)
 
 struct forth_builtin {
     const char *name;
-    size_t name_len;
-    const char *c_name;
+
     union {
         void (*callback)(union forth_inst *,
                          double *d_stack,
@@ -93,6 +72,7 @@ struct forth_builtin {
                          struct forth_vars *vars);
         const char *(*callback_compiler)(struct forth_ctx *, const char *);
     };
+
     int d_pushes;
     int d_pops;
     int r_pushes;
@@ -101,17 +81,12 @@ struct forth_builtin {
 
 struct forth_word {
     union {
-        void (*callback)(union forth_inst *,
-                         double *d_stack,
-                         double *r_stack,
-                         struct forth_vars *vars);
-        const char *(*callback_compiler)(struct forth_ctx *ctx,
-                                         const char *code);
-        struct forth_ir_code code;
+        struct forth_code code;
+        const struct forth_builtin *builtin;
     };
-    const struct forth_builtin *builtin;
-    int d_stack_len;
-    int r_stack_len;
+
+    /* name[0] is '\0' for built-in words; to get the name for those, go through
+     * the builtin pointer. */
     char name[];
 };
 
@@ -122,30 +97,31 @@ struct forth_ctx {
             double r_stack[32];
         };
         struct {
-            size_t j_stack[32];
+            size_t j_stack[63];
             size_t *j;
         };
     };
 
-    struct forth_code main_code;
-
     struct forth_word *defining_word;
     struct forth_word *main;
     struct hash *words;
-
-    bool is_inside_word_def;
 };
 
+static inline bool is_inside_word_def(const struct forth_ctx *ctx)
+{
+    return !ctx->defining_word || ctx->defining_word != ctx->main;
+}
 
 static inline bool is_word_builtin(const struct forth_word *w)
 {
-    return !!w->builtin;
+    return w->name[0] == '\0';
 }
 
 static inline bool is_word_compiler(const struct forth_word *w)
 {
     const struct forth_builtin *b = w->builtin;
-    return b && b >= SECTION_START_SYMBOL(forth_compiler_builtin, b) &&
+    return is_word_builtin(w) &&
+           b >= SECTION_START_SYMBOL(forth_compiler_builtin, b) &&
            b < SECTION_STOP_SYMBOL(forth_compiler_builtin, b);
 }
 
@@ -165,20 +141,57 @@ static const struct forth_builtin *find_builtin_by_callback(void *callback)
     return NULL;
 }
 
-static const struct forth_word *find_word_by_code(const struct forth_ctx *ctx,
-                                                  const struct forth_ir_code *code)
+static void op_number(union forth_inst *inst,
+                      double *d_stack,
+                      double *r_stack,
+                      struct forth_vars *vars)
 {
-    struct hash_iter iter;
-    const void *name, *value;
+    *d_stack++ = inst[1].number;
+    TAIL_CALL inst[2].callback(&inst[2], d_stack, r_stack, vars);
+}
 
-    hash_iter_init(ctx->words, &iter);
-    while (hash_iter_next(&iter, &name, &value)) {
-        const struct forth_word *word = value;
-        if (&word->code == code)
-            return word;
-    }
+static void op_jump_if(union forth_inst *inst,
+                       double *d_stack,
+                       double *r_stack,
+                       struct forth_vars *vars)
+{
+    size_t pc = (*--d_stack == 0.0) ? inst[1].pc : 2;
+    TAIL_CALL inst[pc].callback(&inst[pc], d_stack, r_stack, vars);
+}
 
-    return NULL;
+static void op_jump(union forth_inst *inst,
+                    double *d_stack,
+                    double *r_stack,
+                    struct forth_vars *vars)
+{
+    size_t pc = inst[1].pc;
+    TAIL_CALL inst[pc].callback(&inst[pc], d_stack, r_stack, vars);
+}
+
+static void op_nop(union forth_inst *inst,
+                   double *d_stack,
+                   double *r_stack,
+                   struct forth_vars *vars)
+{
+    TAIL_CALL inst[1].callback(&inst[1], d_stack, r_stack, vars);
+}
+
+static void op_halt(union forth_inst *inst __attribute__((unused)),
+                    double *d_stack,
+                    double *r_stack,
+                    struct forth_vars *vars)
+{
+    vars->final_d_stack_ptr = d_stack;
+    vars->final_r_stack_ptr = r_stack;
+}
+
+static void op_eval_code(union forth_inst *inst __attribute__((unused)),
+                         double *d_stack,
+                         double *r_stack,
+                         struct forth_vars *vars)
+{
+    lwan_status_critical("eval_code instruction executed after inlining");
+    __builtin_unreachable();
 }
 
 static bool check_stack_effects(const struct forth_ctx *ctx,
@@ -187,63 +200,64 @@ static bool check_stack_effects(const struct forth_ctx *ctx,
     /* FIXME: this isn't correct when we have JUMP_IF and JUMP
      * instructions: the number of items in the stacks isn't reset
      * to the beginning of either if/else block. */
-    const struct forth_ir *ir;
+    const union forth_inst *inst;
     int items_in_d_stack = 0;
     int items_in_r_stack = 0;
 
     assert(!is_word_builtin(w));
 
-    LWAN_ARRAY_FOREACH(&w->code, ir) {
-        switch (ir->opcode) {
-        case OP_EVAL_CODE: {
-            const struct forth_word *cw = find_word_by_code(ctx, ir->code);
-            if (UNLIKELY(!cw)) {
-                lwan_status_critical("Can't find builtin word by user code");
-                return false;
-            }
-
-            items_in_d_stack += cw->d_stack_len;
-            items_in_r_stack += cw->r_stack_len;
-            break;
-        }
-        case OP_CALL_BUILTIN: {
-            const struct forth_builtin *b = find_builtin_by_callback(ir->callback);
-            if (UNLIKELY(!b)) {
-                lwan_status_critical("Can't find builtin word by callback");
-                return false;
-            }
-
-            if (UNLIKELY(items_in_d_stack < b->d_pops)) {
-                lwan_status_error("Word `%.*s' requires %d item(s) in the D stack",
-                        (int)b->name_len, b->name, b->d_pops);
-                return false;
-            }
-            if (UNLIKELY(items_in_r_stack < b->r_pops)) {
-                lwan_status_error("Word `%.*s' requires %d item(s) in the R stack",
-                        (int)b->name_len, b->name, b->r_pops);
-                return false;
-            }
-
-            items_in_d_stack -= b->d_pops;
-            items_in_d_stack += b->d_pushes;
-            items_in_r_stack -= b->r_pops;
-            items_in_r_stack += b->r_pushes;
-            break;
-        }
-        case OP_NUMBER:
+    LWAN_ARRAY_FOREACH(&w->code, inst) {
+        if (inst->callback == op_number) {
             items_in_d_stack++;
-            break;
-        case OP_JUMP_IF:
+            inst++; /* skip number immediate */
+            continue;
+        }
+        if (inst->callback == op_jump_if) {
             if (UNLIKELY(!items_in_d_stack)) {
                 lwan_status_error("Word `if' requires 1 item(s) in the D stack");
                 return false;
             }
             items_in_d_stack--;
-            break;
-        case OP_NOP:
-        case OP_JUMP:
+            inst++; /* skip pc immediate */
             continue;
         }
+        if (inst->callback == op_jump) {
+            inst++; /* skip pc immediate */
+            continue;
+        }
+        if (inst->callback == op_halt) {
+            continue; /* no immediate for halt */
+        }
+        if (inst->callback == op_nop) {
+            continue; /* no immediate for nop */
+        }
+        if (UNLIKELY(inst->callback == op_eval_code)) {
+            lwan_status_critical("eval_code after inlining");
+            __builtin_unreachable();
+        }
+
+        /* all other built-ins */
+        const struct forth_builtin *b = find_builtin_by_callback(inst->callback);
+        if (UNLIKELY(!b)) {
+            lwan_status_critical("Can't find builtin word by callback");
+            __builtin_unreachable();
+        }
+
+        if (UNLIKELY(items_in_d_stack < b->d_pops)) {
+            lwan_status_error("Word `%s' requires %d item(s) in the D stack",
+                              b->name, b->d_pops);
+            return false;
+        }
+        if (UNLIKELY(items_in_r_stack < b->r_pops)) {
+            lwan_status_error("Word `%s' requires %d item(s) in the R stack",
+                              b->name, b->r_pops);
+            return false;
+        }
+
+        items_in_d_stack -= b->d_pops;
+        items_in_d_stack += b->d_pushes;
+        items_in_r_stack -= b->r_pops;
+        items_in_r_stack += b->r_pushes;
 
         if (UNLIKELY(items_in_d_stack >= (int)N_ELEMENTS(ctx->d_stack))) {
             lwan_status_error("Program would cause a stack overflow in the D stack");
@@ -255,44 +269,16 @@ static bool check_stack_effects(const struct forth_ctx *ctx,
         }
     }
 
-    w->d_stack_len = items_in_d_stack;
-    w->r_stack_len = items_in_r_stack;
+    if (UNLIKELY(items_in_d_stack < 0)) {
+        lwan_status_error("Program would underflow the D stack");
+        return false;
+    }
+    if (UNLIKELY(items_in_r_stack < 0)) {
+        lwan_status_error("Program would underflow the R stack");
+        return false;
+    }
 
     return true;
-}
-
-#if defined(DUMP_CODE)
-static void dump_code_ir(const struct forth_ir_code *code)
-{
-    const struct forth_ir *ir;
-    size_t i = 0;
-
-    printf("dumping code @ %p\n", code);
-
-    LWAN_ARRAY_FOREACH (code, ir) {
-        printf("%08zu    ", i);
-        i++;
-
-        switch (ir->opcode) {
-        case OP_EVAL_CODE:
-            printf("eval code %p\n", ir->code);
-            break;
-        case OP_CALL_BUILTIN:
-            printf("call builtin %p\n", ir->callback);
-            break;
-        case OP_NUMBER:
-            printf("number %lf\n", ir->number);
-            break;
-        case OP_JUMP_IF:
-            printf("if [next %zu]\n", ir->pc);
-            break;
-        case OP_JUMP:
-            printf("jump to %zu\n", ir->pc);
-            break;
-        case OP_NOP:
-            printf("nop\n");
-        }
-    }
 }
 
 #define JS_PUSH(val_)                                                          \
@@ -308,212 +294,67 @@ static void dump_code_ir(const struct forth_ir_code *code)
         *--j;                                                                  \
     })
 
-static const char *c_builtin_name(const struct forth_builtin *b,
-                                  char buffer[static 64])
+#if defined(DUMP_CODE)
+static void dump_code(const struct forth_code *code)
 {
-    /* FIXME add op_* names to forth_builtin; maybe do this during new_word()? */
-    if (streq(b->name, "+"))
-        return "op_add";
-    if (streq(b->name, "-"))
-        return "op_sub";
-    if (streq(b->name, "/"))
-        return "op_div";
-    if (streq(b->name, "*"))
-        return "op_mult";
-    if (streq(b->name, "<>"))
-        return "op_diff";
-    if (streq(b->name, "="))
-        return "op_eq";
-    if (streq(b->name, ">"))
-        return "op_gt";
-    if (streq(b->name, ">="))
-        return "op_gte";
-    if (streq(b->name, "<"))
-        return "op_lt";
-    if (streq(b->name, "<="))
-        return "op_lte";
-    if (streq(b->name, "**"))
-        return "op_pow";
-    if (streq(b->name, "%"))
-        return "op_mod";
-    if (streq(b->name, ">r"))
-        return "op_tor";
-    if (streq(b->name, "r>"))
-        return "op_fromr";
-    if (streq(b->name, "r@"))
-        return "op_rtord";
-    if (streq(b->name, "@"))
-        return "op_recall";
-    if (streq(b->name, "!"))
-        return "op_store";
-    if (streq(b->name, "2dup"))
-        return "op_2dup";
-    if (streq(b->name, "z+"))
-        return "op_zplus";
-    if (streq(b->name, "z*"))
-        return "op_zmult";
-    if (streq(b->name, "-rot"))
-        return "op_minusrot";
-    int ret = snprintf(buffer, 64, "op_%s", b->name);
-    return (ret < 0 || ret > 64) ? NULL : buffer;
-}
-
-
-#define GET_TMP(num_)                                                          \
-    ({                                                                         \
-        int n = (num_);                                                        \
-        const char *out;                                                       \
-        if (n > last_undeclared) {                                             \
-            out = "double tmp";                                                \
-            last_undeclared = n;                                               \
-        } else {                                                               \
-            out = "tmp";                                                       \
-        }                                                                      \
-        out;                                                                   \
-    })
-
-static bool dump_code_c(const struct forth_ir_code *code)
-{
-    size_t jump_stack[64];
-    size_t *j = jump_stack;
-    char name_buffer[64];
-    int last_tmp = 0;
-    int last_undeclared = -1;
-    const struct forth_ir *ir;
+    const union forth_inst *inst;
 
     printf("dumping code @ %p\n", code);
 
-    fwrite(forth_jit_value.value, forth_jit_value.len, 1, stdout);
-    printf("void compute(double x, double y, double t, double *r, double *g, "
-           "double *b) {\n");
+    LWAN_ARRAY_FOREACH (code, inst) {
+        printf("%08zu    ",
+               forth_code_get_elem_index(code, (union forth_inst *)inst));
 
-    LWAN_ARRAY_FOREACH (code, ir) {
-        switch (ir->opcode) {
-        case OP_EVAL_CODE:
+        if (inst->callback == op_number) {
+            inst++;
+            printf("number %lf\n", inst->number);
+        } else if (inst->callback == op_jump_if) {
+            printf("if [next +%zu, abs %zu]\n", inst[1].pc,
+                   forth_code_get_elem_index(code, (union forth_inst *)inst) +
+                       inst[1].pc);
+            inst++;
+        } else if (inst->callback == op_jump) {
+            printf("jump to +%zu, abs %zu\n", inst[1].pc,
+                   forth_code_get_elem_index(code, (union forth_inst *)inst) +
+                       inst[1].pc);
+            inst++;
+        } else if (inst->callback == op_halt) {
+            printf("halt\n");
+        } else if (inst->callback == op_nop) {
+            printf("nop\n");
+        } else if (UNLIKELY(inst->callback == op_eval_code)) {
+            lwan_status_critical("eval_code shouldn't exist here");
             __builtin_unreachable();
-        case OP_CALL_BUILTIN: {
+        } else {
             const struct forth_builtin *b =
-                find_builtin_by_callback(ir->callback);
-            last_tmp -= b->d_pops;
-
-            if (b->d_pushes == 0) {
-                printf("    %s(", c_builtin_name(b, name_buffer));
-                for (int arg = 0; arg < b->d_pops; arg++) {
-                    printf("tmp%d, ", last_tmp + arg - 1);
-                }
-                printf(");\n");
-            } else if (b->d_pushes == 1) {
-                if (streq(b->name, "t") || streq(b->name, "x") ||
-                    streq(b->name, "y")) {
-                    int t = last_tmp++;
-                    printf("    %s%d = %s;\n", GET_TMP(t), t, b->name);
+                find_builtin_by_callback(inst->callback);
+            if (b) {
+                if (b->name[0] == ' ') {
+                    printf("call private builtin '%s'\n", b->name + 1);
                 } else {
-                    int t = last_tmp++;
-                    printf("    %s%d = %s(", GET_TMP(t), t,
-                           c_builtin_name(b, name_buffer));
-                    for (int arg = 0; arg < b->d_pops; arg++) {
-                        t = last_tmp + arg - 1;
-                        if (arg == b->d_pops - 1) {
-                            printf("tmp%d", t);
-                        } else {
-                            printf("tmp%d, ", t);
-                        }
-                    }
-                    printf(");\n");
+                    printf("call builtin '%s'\n", b->name);
                 }
-
             } else {
-                printf("    %s(", c_builtin_name(b, name_buffer));
-                for (int arg = 0; arg < b->d_pops; arg++) {
-                    printf("tmp%d, ", last_tmp + arg - 1);
-                }
-                for (int out_arg = 0; out_arg < b->d_pushes; out_arg++) {
-                    int t = last_tmp + out_arg - 1;
-                    if (out_arg == b->d_pushes - 1) {
-                        printf("&tmp%d", t);
-                    } else {
-                        printf("&tmp%d, ", t);
-                    }
-                }
-                last_tmp += b->d_pushes;
-                printf(");\n");
+                printf("*** inconsistency; value = %zu ***\n", inst->pc);
             }
-
-            break;
-        }
-        case OP_NUMBER: {
-            int t = last_tmp++;
-            printf("    %s%d = %lf;\n", GET_TMP(t), t, ir->number);
-            break;
-        }
-        case OP_JUMP_IF:
-            printf("    if (tmp%d == 0.0) {\n", --last_tmp);
-            JS_PUSH((size_t)last_tmp);
-            JS_PUSH((size_t)last_undeclared);
-            break;
-        case OP_JUMP:
-            printf("    } else {\n");
-            last_undeclared = (int)JS_POP();
-            last_tmp = (int)JS_POP();
-            JS_PUSH((size_t)last_undeclared);
-            break;
-        case OP_NOP:
-            printf("    }\n");
-            last_undeclared = (int)JS_POP();
-            break;
         }
     }
-
-    switch (last_tmp) {
-    case 3:
-        printf("    *r = tmp2;\n");
-        printf("    *g = tmp1;\n");
-        printf("    *b = tmp0;\n");
-        break;
-    case 4:
-        printf("    *r = tmp3;\n");
-        printf("    *g = tmp2;\n");
-        printf("    *b = tmp1;\n");
-        break;
-    default:
-        printf("    *r = *g = *b = 0.0;\n");
-    }
-
-    printf("}\n");
-
-    return true;
-}
-
-static void dump_code(const struct forth_ir_code *code)
-{
-    dump_code_ir(code);
-    dump_code_c(code);
 }
 #endif
 
 bool forth_run(struct forth_ctx *ctx, struct forth_vars *vars)
 {
-    union forth_inst *instr = forth_code_get_elem(&ctx->main_code, 0);
+    union forth_inst *instr = forth_code_get_elem(&ctx->main->code, 0);
     instr->callback(instr, ctx->d_stack, ctx->r_stack, vars);
     return true;
 }
 
-static struct forth_ir *new_ir(struct forth_ctx *ctx)
-{
-    /* FIXME: if last irruction is NOP, maybe we can reuse it? */
-
-    if (UNLIKELY(!ctx->defining_word))
-        return NULL;
-
-    return forth_ir_code_append(&ctx->defining_word->code);
-}
-
-static bool parse_number(const char *ptr, size_t len, double *number)
+static bool parse_number(const char *ptr, double *number)
 {
     char *endptr;
 
     errno = 0;
-    *number = strtod(strndupa(ptr, len), &endptr);
+    *number = strtod(ptr, &endptr);
 
     if (errno != 0)
         return false;
@@ -524,31 +365,38 @@ static bool parse_number(const char *ptr, size_t len, double *number)
     return true;
 }
 
-static struct forth_word *new_word(struct forth_ctx *ctx,
-                                   const char *name,
-                                   size_t len,
-                                   void *callback,
-                                   const struct forth_builtin *builtin)
+static struct forth_word *new_builtin_word(struct forth_ctx *ctx,
+                                           const struct forth_builtin *builtin)
 {
-    if (len > 64)
+    struct forth_word *word = malloc(sizeof(*word) + 1);
+    if (UNLIKELY(!word))
+        return NULL;
+
+    word->builtin = builtin;
+    word->name[0] = '\0';
+
+    if (!hash_add(ctx->words, builtin->name, word))
+        return word;
+
+    free(word);
+    return NULL;
+}
+
+static struct forth_word *
+new_user_word(struct forth_ctx *ctx, const char *name)
+{
+    const size_t len = strlen(name);
+    if (UNLIKELY(len > MAX_WORD_LEN))
         return NULL;
 
     struct forth_word *word = malloc(sizeof(*word) + len + 1);
     if (UNLIKELY(!word))
         return NULL;
 
-    if (callback) {
-        word->callback = callback;
-    } else {
-        forth_ir_code_init(&word->code);
-    }
-
-    word->builtin = builtin;
-    word->d_stack_len = 0;
-    word->r_stack_len = 0;
-
-    strncpy(word->name, name, len);
+    memcpy(word->name, name, len);
     word->name[len] = '\0';
+
+    forth_code_init(&word->code);
 
     if (!hash_add(ctx->words, word->name, word))
         return word;
@@ -557,60 +405,321 @@ static struct forth_word *new_word(struct forth_ctx *ctx,
     return NULL;
 }
 
-static struct forth_word *
-lookup_word(struct forth_ctx *ctx, const char *name, size_t len)
+static struct forth_word *new_word(struct forth_ctx *ctx,
+                                   const char *name,
+                                   const struct forth_builtin *builtin)
 {
-    return hash_find(ctx->words, strndupa(name, len));
+    return builtin ? new_builtin_word(ctx, builtin)
+                   : new_user_word(ctx, name);
 }
 
-#define EMIT_IR(...)                                                           \
-    do {                                                                       \
-        struct forth_ir *ir_inst = new_ir(ctx);                                \
-        if (UNLIKELY(!ir_inst))                                                \
+#define EMIT(arg)                                                              \
+    ({                                                                         \
+        union forth_inst *emitted =                                            \
+            forth_code_append(&ctx->defining_word->code);                      \
+        if (UNLIKELY(!emitted))                                                \
             return NULL;                                                       \
-        *ir_inst = (struct forth_ir){__VA_ARGS__};                             \
-    } while (0)
+        *emitted = (union forth_inst){arg};                                    \
+        forth_code_get_elem_index(&ctx->defining_word->code, emitted);         \
+    })
+
+static bool peephole_1(struct forth_ctx *ctx,
+                       struct forth_code *code,
+                       const struct forth_builtin *b)
+{
+    union forth_inst *last =
+        forth_code_get_elem(code, forth_code_len(code) - 1);
+
+    if (streq(b->name, "+")) {
+        const struct forth_word *w = hash_find(ctx->words, "*");
+        assert(w != NULL);
+        assert(is_word_builtin(w));
+        if (last[0].callback == w->builtin->callback) {
+            w = hash_find(ctx->words, " fma");
+            assert(w != NULL);
+            assert(is_word_builtin(w));
+            last[0].callback = w->builtin->callback;
+            return true;
+        }
+    } else if (streq(b->name, "*")) {
+        const struct forth_builtin *prev_b =
+            find_builtin_by_callback(last[0].callback);
+        if (prev_b && streq(prev_b->name, "pi")) {
+            const struct forth_word *w = hash_find(ctx->words, " multpi");
+            assert(w != NULL);
+            assert(is_word_builtin(w));
+            last[0].callback = w->builtin->callback;
+            return true;
+        }
+    } else if (streq(b->name, "dup")) {
+        if (last[0].callback == b->callback) {
+            const struct forth_word *w = hash_find(ctx->words, " dupdup");
+            assert(w != NULL);
+            assert(is_word_builtin(w));
+            last[0].callback = w->builtin->callback;
+            return true;
+        }
+    } else if (streq(b->name, "swap")) {
+        const struct forth_word *w = hash_find(ctx->words, "-rot");
+        assert(w != NULL);
+        assert(is_word_builtin(w));
+        if (last[0].callback == w->builtin->callback) {
+            w = hash_find(ctx->words, " -rotswap");
+            last[0].callback = w->builtin->callback;
+            return true;
+        }
+
+        w = hash_find(ctx->words, ">=");
+        assert(w != NULL);
+        assert(is_word_builtin(w));
+        if (last[0].callback == w->builtin->callback) {
+            w = hash_find(ctx->words, " >=swap");
+            last[0].callback = w->builtin->callback;
+            return true;
+        }
+    } else if (streq(b->name, " div2")) {
+        const struct forth_word *w = hash_find(ctx->words, " multpi");
+        assert(w != NULL);
+        assert(is_word_builtin(w));
+        if (last[0].callback == w->builtin->callback) {
+            w = hash_find(ctx->words, " multhalfpi");
+            last[0].callback = w->builtin->callback;
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static bool peephole_n(struct forth_ctx *ctx,
+                       struct forth_code *code,
+                       const struct forth_builtin *b)
+{
+    union forth_inst *last =
+        forth_code_get_elem(code, forth_code_len(code) - 1);
+
+    if (streq(b->name, "/")) {
+        if (last[-1].callback == op_number && last[0].number == 2.0) {
+            const struct forth_word *w = hash_find(ctx->words, " div2");
+            assert(w != NULL);
+            assert(is_word_builtin(w));
+            last[-1].callback = w->builtin->callback;
+            code->base.elements--;
+            return true;
+        }
+    } else if (streq(b->name, "+")) {
+        if (forth_code_len(code) >= 4) {
+            if (last[-1].callback == op_number &&
+                last[-3].callback == op_number) {
+                last[-2].number += last[0].number;
+                code->base.elements -= 2;
+                return true;
+            }
+        }
+    } else if (streq(b->name, "-")) {
+        if (forth_code_len(code) >= 4) {
+            if (last[-1].callback == op_number &&
+                last[-3].callback == op_number) {
+                last[-2].number -= last[0].number;
+                code->base.elements -= 2;
+                return true;
+            }
+        }
+    } else if (streq(b->name, "/")) {
+        if (forth_code_len(code) >= 4) {
+            if (last[-1].callback == op_number &&
+                last[-3].callback == op_number) {
+                if (last[0].number == 0.0) {
+                    last[-2].number = __builtin_inf();
+                } else {
+                    last[-2].number /= last[0].number;
+                }
+                code->base.elements -= 2;
+                return true;
+            }
+        }
+    } else if (streq(b->name, "*")) {
+        if (last[-1].callback == op_number && last[0].number == 2.0) {
+            const struct forth_word *w = hash_find(ctx->words, " mult2");
+            assert(w != NULL);
+            assert(is_word_builtin(w));
+            last[-1].callback = w->builtin->callback;
+            code->base.elements--;
+            return true;
+        }
+
+        if (forth_code_len(code) >= 4) {
+            if (last[-1].callback == op_number &&
+                last[-3].callback == op_number) {
+                last[-2].number *= last[0].number;
+                code->base.elements -= 2;
+                return true;
+            }
+        }
+    } else if (streq(b->name, "**")) {
+        if (last[-1].callback == op_number && last[0].number == 2.0) {
+            const struct forth_word *w = hash_find(ctx->words, " pow2");
+            assert(w != NULL);
+            assert(is_word_builtin(w));
+            last[-1].callback = w->builtin->callback;
+            code->base.elements--;
+            return true;
+        }
+    } else if (streq(b->name, " mult2")) {
+        if (last[-1].callback == op_number) {
+            last[0].number *= 2;
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static bool peephole(struct forth_ctx *ctx)
+{
+    /* FIXME: constprop? */
+    /* FIXME: This is small enough that the current implementation is
+     * fine, but if we end up adding quite a bit more rules, we should
+     * look into making the rule declaration a bit better. */
+    /* FIXME: This should look at the generated code after inlining to
+     * match code between words.  This isn't currently possible because
+     * of branching with if/else/then, but we can make it work by
+     * peepholing the op_nop instruction instead of handling it inside
+     * the inliner. */
+    /* FIXME: Other optimizations are possible -- for instance, a
+     * constant folding step seems trivial to do.  However, things like
+     * strength reduction are a bit tricky considering all numbers are
+     * floating pointing numbers (even if they're double precision).
+     * More sophisticated techniques could be employed but with the
+     * simplistic implementation of this compiler, it might not be
+     * worth the trouble.  */
+    struct forth_code *code = &ctx->defining_word->code;
+    struct forth_code orig_code = *code;
+    union forth_inst *inst;
+    bool modified = false;
+    union forth_inst *new_inst;
+    size_t jump_stack[64];
+    size_t *j = jump_stack;
+
+    forth_code_init(code);
+
+    LWAN_ARRAY_FOREACH (&orig_code, inst) {
+        const struct forth_builtin *b =
+            find_builtin_by_callback(inst->callback);
+        if (b) {
+            if (forth_code_len(code) > 1) {
+                if (peephole_1(ctx, code, b)) {
+                    modified = true;
+                    continue;
+                }
+            }
+            if (forth_code_len(code) > 2) {
+                if (peephole_n(ctx, code, b)) {
+                    modified = true;
+                    continue;
+                }
+            }
+        }
+
+        new_inst = forth_code_append(code);
+        if (!new_inst)
+            goto out;
+
+        *new_inst = *inst;
+
+        bool has_imm = false;
+        if (inst->callback == op_jump_if) {
+            JS_PUSH(forth_code_len(code));
+            has_imm = true;
+        } else if (inst->callback == op_jump) {
+            union forth_inst *if_inst = forth_code_get_elem(code, JS_POP());
+            if_inst->pc = forth_code_len(code) +
+                          forth_code_get_elem_index(code, if_inst) - 2;
+
+            JS_PUSH(forth_code_len(code));
+            has_imm = true;
+        } else if (inst->callback == op_nop) {
+            union forth_inst *else_inst =
+                forth_code_get_elem(code, JS_POP());
+            else_inst->pc = forth_code_len(code) -
+                            forth_code_get_elem_index(code, else_inst) + 1;
+        } else if (inst->callback == op_number) {
+            has_imm = true;
+        }
+
+        if (has_imm) {
+            new_inst = forth_code_append(code);
+            if (!new_inst)
+                goto out;
+
+            inst++;
+            *new_inst = *inst;
+        }
+    }
+
+    forth_code_reset(&orig_code);
+    return modified;
+
+out:
+    forth_code_reset(code);
+    lwan_status_error("Could not run peephole optimizer");
+    return false;
+}
 
 static const char *found_word(struct forth_ctx *ctx,
                               const char *code,
                               const char *word,
                               size_t word_len)
 {
+    if (UNLIKELY(word_len > MAX_WORD_LEN)) {
+        lwan_status_error("Word too long: %zu characters, expecting at most 64",
+                          word_len);
+        return NULL;
+    }
+
+    const char *word_copy = strndupa(word, word_len);
+
     double number;
-    if (parse_number(word, word_len, &number)) {
-        if (LIKELY(ctx->defining_word)) {
-            EMIT_IR(.number = number, .opcode = OP_NUMBER);
-            return code;
+    if (parse_number(word_copy, &number)) {
+        if (UNLIKELY(!ctx->defining_word)) {
+            lwan_status_error("Can't redefine number %lf", number);
+            return NULL;
         }
 
-        lwan_status_error("Can't redefine number %lf", number);
-        return NULL;
+        EMIT(.callback = op_number);
+        EMIT(.number = number);
+
+        return code;
     }
 
-    struct forth_word *w = lookup_word(ctx, word, word_len);
+    struct forth_word *w = hash_find(ctx->words, word_copy);
     if (ctx->defining_word) {
-        if (LIKELY(w)) {
-            if (is_word_compiler(w))
-                return w->callback_compiler(ctx, code);
-
-            if (is_word_builtin(w))
-                EMIT_IR(.callback = w->callback, .opcode = OP_CALL_BUILTIN);
-            else
-                EMIT_IR(.code = &w->code, .opcode = OP_EVAL_CODE);
-            return code;
+        if (UNLIKELY(!w)) {
+            lwan_status_error("Undefined word: \"%.*s\"", (int)word_len, word);
+            return NULL;
         }
 
-        lwan_status_error("Undefined word: \"%.*s\"",
-                          (int)word_len, word);
+        if (is_word_builtin(w)) {
+            if (is_word_compiler(w))
+                return w->builtin->callback_compiler(ctx, code);
+
+            EMIT(.callback = w->builtin->callback);
+        } else {
+            EMIT(.callback = op_eval_code);
+            EMIT(.code = &w->code);
+        }
+
+        return code;
+    }
+
+    if (UNLIKELY(w != NULL)) {
+        lwan_status_error("Can't redefine %sword \"%.*s\"",
+                          is_word_builtin(w) ? "built-in " : "", (int)word_len,
+                          word);
         return NULL;
     }
 
-    if (LIKELY(w != NULL)) {
-        lwan_status_error("Word already defined: \"%.*s\"", (int)word_len, word);
-        return NULL;
-    }
-
-    w = new_word(ctx, word, word_len, NULL, NULL);
+    w = new_word(ctx, word_copy, NULL);
     if (UNLIKELY(!w)) {
         lwan_status_error("Can't create new word");
         return NULL;
@@ -620,37 +729,59 @@ static const char *found_word(struct forth_ctx *ctx,
     return code;
 }
 
-static bool inline_calls_code(struct forth_ctx *ctx,
-                              const struct forth_ir_code *orig_code,
-                              struct forth_ir_code *new_code)
+static bool inline_calls_code(const struct forth_code *orig_code,
+                              struct forth_code *new_code,
+                              int nested)
 {
-    const struct forth_ir *ir;
+    const union forth_inst *inst;
     size_t jump_stack[64];
     size_t *j = jump_stack;
 
-    LWAN_ARRAY_FOREACH (orig_code, ir) {
-        if (ir->opcode == OP_EVAL_CODE) {
-            if (!inline_calls_code(ctx, ir->code, new_code)) {
+    if (!nested) {
+        lwan_status_error("Recursion limit reached while inlining");
+        return false;
+    }
+
+    LWAN_ARRAY_FOREACH (orig_code, inst) {
+        if (inst->callback == op_eval_code) {
+            inst++;
+            if (!inline_calls_code(inst->code, new_code, nested - 1))
                 return false;
-            }
         } else {
-            struct forth_ir *new_ir = forth_ir_code_append(new_code);
-            if (!new_ir)
+            union forth_inst *new_inst = forth_code_append(new_code);
+            if (!new_inst)
                 return false;
 
-            *new_ir = *ir;
+            *new_inst = *inst;
 
-            if (ir->opcode == OP_JUMP_IF) {
-                JS_PUSH(forth_ir_code_len(new_code) - 1);
-            } else if (ir->opcode == OP_JUMP) {
-                struct forth_ir *if_ir =
-                    forth_ir_code_get_elem(new_code, JS_POP());
-                if_ir->pc = forth_ir_code_len(new_code) - 1;
-                JS_PUSH(forth_ir_code_len(new_code) - 1);
-            } else if (ir->opcode == OP_NOP) {
-                struct forth_ir *else_ir =
-                    forth_ir_code_get_elem(new_code, JS_POP());
-                else_ir->pc = forth_ir_code_len(new_code) - 1;
+            bool has_imm = false;
+            if (inst->callback == op_jump_if) {
+                JS_PUSH(forth_code_len(new_code));
+                has_imm = true;
+            } else if (inst->callback == op_jump) {
+                union forth_inst *if_inst =
+                    forth_code_get_elem(new_code, JS_POP());
+                if_inst->pc = forth_code_len(new_code) +
+                              forth_code_get_elem_index(new_code, if_inst) - 2;
+
+                JS_PUSH(forth_code_len(new_code));
+                has_imm = true;
+            } else if (inst->callback == op_nop) {
+                union forth_inst *else_inst =
+                    forth_code_get_elem(new_code, JS_POP());
+                else_inst->pc = forth_code_len(new_code) -
+                                forth_code_get_elem_index(new_code, else_inst) + 1;
+            } else if (inst->callback == op_number) {
+                has_imm = true;
+            }
+
+            if (has_imm) {
+                new_inst = forth_code_append(new_code);
+                if (!new_inst)
+                    return false;
+
+                inst++;
+                *new_inst = *inst;
             }
         }
     }
@@ -660,117 +791,19 @@ static bool inline_calls_code(struct forth_ctx *ctx,
 
 static bool inline_calls(struct forth_ctx *ctx)
 {
-    struct forth_ir_code new_main;
+    struct forth_code new_main;
 
-    forth_ir_code_init(&new_main);
-    if (!inline_calls_code(ctx, &ctx->main->code, &new_main)) {
-        forth_ir_code_reset(&new_main);
+    forth_code_init(&new_main);
+    if (!inline_calls_code(&ctx->main->code, &new_main, 100)) {
+        forth_code_reset(&new_main);
         return false;
     }
 
-    forth_ir_code_reset(&ctx->main->code);
+    forth_code_reset(&ctx->main->code);
     ctx->main->code = new_main;
 
     return true;
 }
-
-static void op_number(union forth_inst *inst,
-                      double *d_stack,
-                      double *r_stack,
-                      struct forth_vars *vars)
-{
-    *d_stack++ = inst[1].number;
-    return inst[2].callback(&inst[2], d_stack, r_stack, vars);
-}
-
-static void op_jump_if(union forth_inst *inst,
-                       double *d_stack,
-                       double *r_stack,
-                       struct forth_vars *vars)
-{
-    size_t pc = (*--d_stack == 0.0) ? inst[1].pc : 2;
-    return inst[pc].callback(&inst[pc], d_stack, r_stack, vars);
-}
-
-static void op_jump(union forth_inst *inst,
-                    double *d_stack,
-                    double *r_stack,
-                    struct forth_vars *vars)
-{
-    size_t pc = inst[1].pc;
-    return inst[pc].callback(&inst[pc], d_stack, r_stack, vars);
-}
-
-static void op_nop(union forth_inst *inst,
-                   double *d_stack,
-                   double *r_stack,
-                   struct forth_vars *vars)
-{
-    return inst[1].callback(&inst[1], d_stack, r_stack, vars);
-}
-
-static void op_halt(union forth_inst *inst __attribute__((unused)),
-                    double *d_stack,
-                    double *r_stack,
-                    struct forth_vars *vars)
-{
-    vars->final_d_stack_ptr = d_stack;
-    vars->final_r_stack_ptr = r_stack;
-}
-
-#define EMIT(arg)                                                              \
-    do {                                                                       \
-        union forth_inst *inst = forth_code_append(&ctx->main_code);           \
-        if (UNLIKELY(!inst))                                                   \
-            goto out;                                                          \
-        *inst = (union forth_inst){arg};                                       \
-    } while (0)
-
-static bool ir_to_inst(struct forth_ctx *ctx)
-{
-    const struct forth_ir *ir;
-    
-    forth_code_init(&ctx->main_code);
-
-    LWAN_ARRAY_FOREACH (&ctx->main->code, ir) {
-        switch (ir->opcode) {
-        case OP_NUMBER:
-            EMIT(.callback = op_number);
-            EMIT(.number = ir->number);
-            break;
-        case OP_JUMP_IF:
-            assert(ir->pc);
-            EMIT(.callback = op_jump_if);
-            EMIT(.pc = ir->pc - 1);
-            break;
-        case OP_JUMP:
-            assert(ir->pc);
-            EMIT(.callback = op_jump);
-            EMIT(.pc = ir->pc - 1);
-            break;
-        case OP_NOP:
-            EMIT(.callback = op_nop);
-            break;
-        case OP_CALL_BUILTIN:
-            EMIT(.callback = ir->callback);
-            break;
-        case OP_EVAL_CODE:
-            __builtin_unreachable();
-        }
-    }
-
-    EMIT(.callback = op_halt);
-
-    forth_ir_code_reset(&ctx->main->code);
-
-    return true;
-
-out:
-    forth_code_reset(&ctx->main_code);
-    return false;
-}
-
-#undef EMIT
 
 bool forth_parse_string(struct forth_ctx *ctx, const char *code)
 {
@@ -787,7 +820,7 @@ bool forth_parse_string(struct forth_ctx *ctx, const char *code)
         while (true) {
             if (*code == '\0') {
                 if (word_ptr == code)
-                    return true;
+                    goto finish;
                 break;
             }
             if (isspace(*code))
@@ -807,8 +840,19 @@ bool forth_parse_string(struct forth_ctx *ctx, const char *code)
         code++;
     }
 
+finish:
+    if (is_inside_word_def(ctx)) {
+        lwan_status_error("Word definition not finished");
+        return false;
+    }
+
+    EMIT(.callback = op_halt);
+
     if (!inline_calls(ctx))
         return false;
+
+    if (peephole(ctx))
+        peephole(ctx);
 
 #if defined(DUMP_CODE)
     dump_code(&ctx->main->code);
@@ -817,14 +861,10 @@ bool forth_parse_string(struct forth_ctx *ctx, const char *code)
     if (!check_stack_effects(ctx, ctx->main))
         return false;
 
-    if (!ir_to_inst(ctx))
-        return false;
-
     return true;
 }
 
-#define C_NAME(id_) #id_
-
+/* FIXME: mark a builtin as "constant" for constprop? */
 #define BUILTIN_DETAIL(name_, id_, struct_id_, d_pushes_, d_pops_, r_pushes_,  \
                        r_pops_)                                                \
     static void id_(union forth_inst *inst, double *d_stack, double *r_stack,  \
@@ -833,8 +873,6 @@ bool forth_parse_string(struct forth_ctx *ctx, const char *code)
     __attribute__((section(LWAN_SECTION_NAME(forth_builtin))))                 \
     __attribute__((aligned(8))) struct_id_ = {                                 \
         .name = name_,                                                         \
-        .name_len = sizeof(name_) - 1,                                         \
-        .c_name = C_NAME(id_),                                                 \
         .callback = id_,                                                       \
         .d_pushes = d_pushes_,                                                 \
         .d_pops = d_pops_,                                                     \
@@ -850,7 +888,6 @@ bool forth_parse_string(struct forth_ctx *ctx, const char *code)
     __attribute__((section(LWAN_SECTION_NAME(forth_compiler_builtin))))        \
     __attribute__((aligned(8))) struct_id_ = {                                 \
         .name = name_,                                                         \
-        .name_len = sizeof(name_) - 1,                                         \
         .callback_compiler = id_,                                              \
     };                                                                         \
     static const char *id_(struct forth_ctx *ctx __attribute__((unused)),      \
@@ -879,12 +916,11 @@ BUILTIN_COMPILER("(")
 
 BUILTIN_COMPILER(":")
 {
-    if (UNLIKELY(ctx->is_inside_word_def)) {
+    if (UNLIKELY(is_inside_word_def(ctx))) {
         lwan_status_error("Already defining word");
         return NULL;
     }
 
-    ctx->is_inside_word_def = true;
     ctx->defining_word = NULL;
     return code;
 }
@@ -896,15 +932,8 @@ BUILTIN_COMPILER(";")
         return NULL;
     }
 
-    if (UNLIKELY(!ctx->is_inside_word_def)) {
+    if (UNLIKELY(!is_inside_word_def(ctx))) {
         lwan_status_error("Ending word without defining one");
-        return NULL;
-    }
-
-    ctx->is_inside_word_def = false;
-
-    if (UNLIKELY(!ctx->defining_word)) {
-        lwan_status_error("No word provided");
         return NULL;
     }
 
@@ -914,33 +943,46 @@ BUILTIN_COMPILER(";")
 
 BUILTIN_COMPILER("if")
 {
-    *ctx->j++ = forth_ir_code_len(&ctx->defining_word->code);
+    if ((size_t)(ctx->j - ctx->j_stack) >= N_ELEMENTS(ctx->j_stack)) {
+        lwan_status_error("Too many nested 'if' words");
+        return NULL;
+    }
 
-    EMIT_IR(.opcode = OP_JUMP_IF);
-
+    EMIT(.callback = op_jump_if);
+    *ctx->j++ = EMIT(.pc = 0);
     return code;
 }
 
 static const char *
 builtin_else_then(struct forth_ctx *ctx, const char *code, bool is_then)
 {
-    struct forth_ir *ir =
-        forth_ir_code_get_elem(&ctx->defining_word->code, *--ctx->j);
+    if (ctx->j == ctx->j_stack) {
+        lwan_status_error("'%s' before 'if'", is_then ? "then" : "else");
+        return NULL;
+    }
 
-    ir->pc = forth_ir_code_len(&ctx->defining_word->code);
+    union forth_inst *prev_pc_imm =
+        forth_code_get_elem(&ctx->defining_word->code, *--ctx->j);
 
     if (is_then) {
-        EMIT_IR(.opcode = OP_NOP);
+        EMIT(.callback = op_nop);
     } else {
-        *ctx->j++ = ir->pc;
-        EMIT_IR(.opcode = OP_JUMP);
+        EMIT(.callback = op_jump);
+
+        if ((size_t)(ctx->j - ctx->j_stack) >= N_ELEMENTS(ctx->j_stack)) {
+            lwan_status_error("Else is too deep");
+            return NULL;
+        }
+
+        *ctx->j++ = EMIT(.pc = 0);
     }
+
+    prev_pc_imm->pc = forth_code_len(&ctx->defining_word->code);
 
     return code;
 }
 
 BUILTIN_COMPILER("else") { return builtin_else_then(ctx, code, false); }
-
 BUILTIN_COMPILER("then") { return builtin_else_then(ctx, code, true); }
 
 #define PUSH_D(value_) ({ *d_stack = (value_); d_stack++; })
@@ -950,7 +992,7 @@ BUILTIN_COMPILER("then") { return builtin_else_then(ctx, code, true); }
 #define POP_D() ({ DROP_D(); *d_stack; })
 #define POP_R() ({ DROP_R(); *r_stack; })
 
-#define NEXT() return inst[1].callback(&inst[1], d_stack, r_stack, vars)
+#define NEXT() TAIL_CALL inst[1].callback(&inst[1], d_stack, r_stack, vars)
 
 BUILTIN("x", 1, 0)
 {
@@ -1084,6 +1126,16 @@ BUILTIN("dup", 2, 1)
     NEXT();
 }
 
+BUILTIN(" dupdup", 4, 1)
+{
+    double v = POP_D();
+    PUSH_D(v);
+    PUSH_D(v);
+    PUSH_D(v);
+    PUSH_D(v);
+    NEXT();
+}
+
 BUILTIN("over", 3, 2)
 {
     double v1 = POP_D();
@@ -1164,6 +1216,17 @@ BUILTIN("-rot", 3, 3)
     NEXT();
 }
 
+BUILTIN(" -rotswap", 3, 3)
+{
+    double v1 = POP_D();
+    double v2 = POP_D();
+    double v3 = POP_D();
+    PUSH_D(v1);
+    PUSH_D(v2);
+    PUSH_D(v3);
+    NEXT();
+}
+
 BUILTIN("=", 1, 2)
 {
     double v1 = POP_D();
@@ -1204,6 +1267,17 @@ BUILTIN(">=", 1, 2)
     NEXT();
 }
 
+BUILTIN(" >=swap", 2, 3)
+{
+    double v1 = POP_D();
+    double v2 = POP_D();
+    double v3 = POP_D();
+
+    PUSH_D(v1 >= v2 ? 1.0 : 0.0);
+    PUSH_D(v3);
+    NEXT();
+}
+
 BUILTIN("<=", 1, 2)
 {
     double v1 = POP_D();
@@ -1215,6 +1289,15 @@ BUILTIN("<=", 1, 2)
 BUILTIN("+", 1, 2)
 {
     PUSH_D(POP_D() + POP_D());
+    NEXT();
+}
+
+BUILTIN(" fma", 1, 3)
+{
+    double m1 = POP_D();
+    double m2 = POP_D();
+    double a = POP_D();
+    PUSH_D(fma(m1, m2, a));
     NEXT();
 }
 
@@ -1234,7 +1317,7 @@ BUILTIN("-", 1, 2)
 BUILTIN("/", 1, 2)
 {
     double v = POP_D();
-    if (v == 0.0) {
+    if (UNLIKELY(v == 0.0)) {
         DROP_D();
         PUSH_D(__builtin_inf());
     } else {
@@ -1379,6 +1462,36 @@ BUILTIN("random", 1, 0)
     NEXT();
 }
 
+BUILTIN(" mult2", 1, 1)
+{
+    *(d_stack - 1) *= 2.0;
+    TAIL_CALL inst[1].callback(&inst[1], d_stack, r_stack, vars);
+}
+
+BUILTIN(" pow2", 1, 1)
+{
+    *(d_stack - 1) *= *(d_stack - 1);
+    TAIL_CALL inst[1].callback(&inst[1], d_stack, r_stack, vars);
+}
+
+BUILTIN(" div2", 1, 1)
+{
+    *(d_stack - 1) /= 2.0;
+    TAIL_CALL inst[1].callback(&inst[1], d_stack, r_stack, vars);
+}
+
+BUILTIN(" multpi", 1, 1)
+{
+    *(d_stack - 1) *= M_PI;
+    TAIL_CALL inst[1].callback(&inst[1], d_stack, r_stack, vars);
+}
+
+BUILTIN(" multhalfpi", 1, 1)
+{
+    *(d_stack - 1) *= M_PI / 2.0;
+    TAIL_CALL inst[1].callback(&inst[1], d_stack, r_stack, vars);
+}
+
 #undef NEXT
 
 __attribute__((no_sanitize_address)) static void
@@ -1387,13 +1500,13 @@ register_builtins(struct forth_ctx *ctx)
     const struct forth_builtin *iter;
 
     LWAN_SECTION_FOREACH(forth_builtin, iter) {
-        if (!new_word(ctx, iter->name, iter->name_len, iter->callback, iter)) {
+        if (!new_word(ctx, NULL, iter)) {
             lwan_status_critical("could not register forth word: %s",
                                  iter->name);
         }
     }
     LWAN_SECTION_FOREACH(forth_compiler_builtin, iter) {
-        if (!new_word(ctx, iter->name, iter->name_len, iter->callback_compiler, iter)) {
+        if (!new_word(ctx, NULL, iter)) {
             lwan_status_critical("could not register forth word: %s",
                                  iter->name);
         }
@@ -1405,7 +1518,7 @@ static void word_free(void *ptr)
     struct forth_word *word = ptr;
 
     if (!is_word_builtin(word))
-        forth_ir_code_reset(&word->code);
+        forth_code_reset(&word->code);
     free(word);
 }
 
@@ -1416,15 +1529,13 @@ struct forth_ctx *forth_new(void)
     if (!ctx)
         return NULL;
 
-    ctx->is_inside_word_def = false;
-
     ctx->words = hash_str_new(NULL, word_free);
     if (!ctx->words) {
         free(ctx);
         return NULL;
     }
 
-    struct forth_word *word = new_word(ctx, " ", 1, NULL, NULL);
+    struct forth_word *word = new_word(ctx, " ", NULL);
     if (!word) {
         free(ctx);
         return NULL;
@@ -1444,12 +1555,11 @@ void forth_free(struct forth_ctx *ctx)
         return;
 
     hash_unref(ctx->words);
-    forth_code_reset(&ctx->main_code);
     free(ctx);
 }
 
 size_t forth_d_stack_len(const struct forth_ctx *ctx,
-        const struct forth_vars *vars)
+                         const struct forth_vars *vars)
 {
     return (size_t)(vars->final_d_stack_ptr - ctx->d_stack);
 }
@@ -1501,13 +1611,22 @@ int main(int argc, char *argv[])
 
     if (!forth_parse_string(ctx,
                             ": nice 60 5 4 + + ; : juanita 400 10 5 5 + + + ; "
-                            "x if nice  else juanita then 2 * 4 / 2 *")) {
+                            "x if nice else juanita then 2 * 4 / 2 *")) {
         lwan_status_critical("could not parse forth program");
-        forth_free(ctx);
-        return 1;
+        __builtin_unreachable();
     }
 
-    struct forth_vars vars = {.x = 1, .y = 0};
+    printf("running with x=0\n");
+    struct forth_vars vars = {.x = 0, .y = 0};
+    if (forth_run(ctx, &vars)) {
+        printf("D stack: %zu elems", forth_d_stack_len(ctx, &vars));
+        for (size_t len = forth_d_stack_len(ctx, &vars); len; len--) {
+            printf("   %lf", forth_d_stack_pop(&vars));
+        }
+    }
+
+    printf("\nrunning with x=1\n");
+    vars = (struct forth_vars){.x = 1, .y = 0};
     if (forth_run(ctx, &vars)) {
         printf("D stack: %zu elems", forth_d_stack_len(ctx, &vars));
         for (size_t len = forth_d_stack_len(ctx, &vars); len; len--) {
