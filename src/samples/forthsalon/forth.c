@@ -1385,17 +1385,13 @@ BUILTIN("not", 1, 1)
 
 BUILTIN("min", 1, 2)
 {
-    double v1 = POP_D();
-    double v2 = POP_D();
-    PUSH_D(v1 > v2 ? v2 : v1);
+    PUSH_D(fmin(POP_D(), POP_D()));
     NEXT();
 }
 
 BUILTIN("max", 1, 2)
 {
-    double v1 = POP_D();
-    double v2 = POP_D();
-    PUSH_D(v1 > v2 ? v1 : v2);
+    PUSH_D(fmax(POP_D(), POP_D()));
     NEXT();
 }
 
@@ -1474,31 +1470,31 @@ BUILTIN("random", 1, 0)
 BUILTIN(" mult2", 1, 1)
 {
     *(d_stack - 1) *= 2.0;
-    TAIL_CALL inst[1].callback(&inst[1], d_stack, r_stack, vars);
+    NEXT();
 }
 
 BUILTIN(" pow2", 1, 1)
 {
     *(d_stack - 1) *= *(d_stack - 1);
-    TAIL_CALL inst[1].callback(&inst[1], d_stack, r_stack, vars);
+    NEXT();
 }
 
 BUILTIN(" div2", 1, 1)
 {
     *(d_stack - 1) /= 2.0;
-    TAIL_CALL inst[1].callback(&inst[1], d_stack, r_stack, vars);
+    NEXT();
 }
 
 BUILTIN(" multpi", 1, 1)
 {
     *(d_stack - 1) *= M_PI;
-    TAIL_CALL inst[1].callback(&inst[1], d_stack, r_stack, vars);
+    NEXT();
 }
 
 BUILTIN(" multhalfpi", 1, 1)
 {
     *(d_stack - 1) *= M_PI / 2.0;
-    TAIL_CALL inst[1].callback(&inst[1], d_stack, r_stack, vars);
+    NEXT();
 }
 
 #undef NEXT
